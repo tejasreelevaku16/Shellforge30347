@@ -1,0 +1,452 @@
+
+#define _POSIX_C_SOURCE 200809L
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#include "builtin.h"
+#include "jobs.h"
+#include "job_control.h"
+
+/* =========================================================
+   BUILTIN: cd
+   ========================================================= */
+
+static int builtin_cd(command_t *cmd)
+{
+    const char *directory;
+
+    if (cmd->argc == 1)
+    {
+        directory = getenv("HOME");
+
+        if (directory == NULL)
+        {
+            fprintf(stderr, "cd: HOME not set\n");
+            return -1;
+        }
+    }
+    else if (cmd->argc == 2)
+    {
+        directory = cmd->argv[1];
+    }
+    else
+    {
+        fprintf(stderr, "cd: too many arguments\n");
+        return -1;
+    }
+
+    if (chdir(directory) != 0)
+    {
+        perror("cd");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* =========================================================
+   BUILTIN: pwd
+   ========================================================= */
+
+static int builtin_pwd(command_t *cmd)
+{
+    char current_directory[4096];
+
+    if (cmd->argc > 1)
+    {
+        fprintf(stderr, "pwd: too many arguments\n");
+        return -1;
+    }
+
+    if (getcwd(current_directory, sizeof(current_directory)) == NULL)
+    {
+        perror("pwd");
+        return -1;
+    }
+
+    printf("%s\n", current_directory);
+
+    return 0;
+}
+
+/* =========================================================
+   BUILTIN: echo
+   ========================================================= */
+
+static int builtin_echo(command_t *cmd)
+{
+    for (int i = 1; i < cmd->argc; i++)
+    {
+        printf("%s", cmd->argv[i]);
+
+        if (i < cmd->argc - 1)
+        {
+            printf(" ");
+        }
+    }
+
+    printf("\n");
+
+    return 0;
+}
+
+/* =========================================================
+   BUILTIN: exit
+   ========================================================= */
+
+static int builtin_exit(command_t *cmd)
+{
+    if (cmd->argc > 1)
+    {
+        fprintf(stderr, "exit: too many arguments\n");
+        return -1;
+    }
+
+    /*
+     * Return 1 so the main shell loop can terminate.
+     */
+    return 1;
+}
+
+/* =========================================================
+   BUILTIN: jobs
+   ========================================================= */
+
+int builtin_jobs(command_t *cmd)
+{
+    (void)cmd;
+
+    jobs_print();
+
+    return 0;
+}
+
+/* =========================================================
+   BUILTIN: fg
+   ========================================================= */
+
+int builtin_fg(command_t *cmd)
+{
+    int job_id;
+    int status;
+    job_t *job;
+    pid_t result;
+
+    if (cmd->argc != 2)
+    {
+        fprintf(stderr, "fg: usage: fg <job number>\n");
+        return 1;
+    }
+
+    char *endptr;
+    long parsed_id = strtol(cmd->argv[1], &endptr, 10);
+
+    if (*cmd->argv[1] == '\0' || *endptr != '\0' ||
+        parsed_id <= 0 || parsed_id > 2147483647L)
+    {
+        fprintf(stderr, "fg: invalid job number\n");
+        return 1;
+    }
+
+    job_id = (int)parsed_id;
+    job = job_find(job_id);
+
+    if (job == NULL)
+    {
+        fprintf(stderr, "fg: no such job: %d\n", job_id);
+        return 1;
+    }
+
+    /*
+     * Give the terminal to the foreground process group.
+     */
+    give_terminal_to(job->pgid);
+
+    if (job->state == JOB_STOPPED)
+    {
+        if (kill(-job->pgid, SIGCONT) == -1)
+        {
+            perror("fg: SIGCONT");
+            take_terminal_back();
+            return 1;
+        }
+    }
+
+    job_continue(job->pgid);
+
+    /*
+     * Wait for the foreground process group.
+     */
+    while (1)
+    {
+        result = waitpid(-job->pgid, &status, WUNTRACED);
+
+        if (result == -1)
+        {
+            /*
+             * EINTR means a signal interrupted waitpid.
+             */
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            /*
+             * The job may already have been reaped elsewhere.
+             */
+            break;
+        }
+
+        if (WIFSTOPPED(status))
+        {
+            job_stop(job->pgid);
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status))
+        {
+            job_done(job->pgid);
+            break;
+        }
+    }
+
+    /*
+     * Return the terminal to Shellforge.
+     */
+    take_terminal_back();
+
+    /*
+     * Remove a completed job from the job list.
+     */
+    job = job_find(job_id);
+
+    if (job != NULL && job->state == JOB_DONE)
+    {
+        job_remove(job_id);
+    }
+
+    return 0;
+}
+
+/* =========================================================
+   BUILTIN: bg
+   ========================================================= */
+
+int builtin_bg(command_t *cmd)
+{
+    int job_id;
+    job_t *job;
+
+    if (cmd->argc != 2)
+    {
+        fprintf(stderr, "bg: usage: bg <job number>\n");
+        return 1;
+    }
+
+    char *endptr;
+    long parsed_id = strtol(cmd->argv[1], &endptr, 10);
+
+    if (*cmd->argv[1] == '\0' || *endptr != '\0' ||
+        parsed_id <= 0 || parsed_id > 2147483647L)
+    {
+        fprintf(stderr, "bg: invalid job number\n");
+        return 1;
+    }
+
+    job_id = (int)parsed_id;
+    job = job_find(job_id);
+
+    if (job == NULL)
+    {
+        fprintf(stderr, "bg: job not found: %d\n", job_id);
+        return 1;
+    }
+
+    if (kill(-job->pgid, SIGCONT) == -1)
+    {
+        perror("bg: kill");
+        return 1;
+    }
+
+    job_continue(job->pgid);
+
+    printf("[%d] %s &\n", job->job_id, job->command);
+
+    return 0;
+}
+
+/* =========================================================
+   CHECK WHETHER COMMAND IS A BUILTIN
+   ========================================================= */
+
+int is_builtin(const command_t *cmd)
+{
+    if (cmd == NULL || cmd->argc == 0 || cmd->argv[0] == NULL)
+    {
+        return 0;
+    }
+
+    if (strcmp(cmd->argv[0], "cd") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "pwd") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "echo") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "exit") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "jobs") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "fg") == 0)
+        return 1;
+
+    if (strcmp(cmd->argv[0], "bg") == 0)
+        return 1;
+
+    return 0;
+}
+
+/* =========================================================
+   EXECUTE BUILTIN
+   ========================================================= */
+
+int execute_builtin(command_t *cmd)
+{
+    if (cmd == NULL || cmd->argc == 0 || cmd->argv[0] == NULL)
+    {
+        return -1;
+    }
+
+
+    if (strcmp(cmd->argv[0], "cd") == 0)
+        return builtin_cd(cmd);
+
+    if (strcmp(cmd->argv[0], "pwd") == 0)
+        return builtin_pwd(cmd);
+
+    if (strcmp(cmd->argv[0], "echo") == 0)
+        return builtin_echo(cmd);
+
+    if (strcmp(cmd->argv[0], "exit") == 0)
+        return builtin_exit(cmd);
+
+    if (strcmp(cmd->argv[0], "jobs") == 0)
+        return builtin_jobs(cmd);
+
+    if (strcmp(cmd->argv[0], "fg") == 0)
+        return builtin_fg(cmd);
+
+    if (strcmp(cmd->argv[0], "bg") == 0)
+        return builtin_bg(cmd);
+
+    return -1;
+}
+
+/* =========================================================
+   CUSTOM BUILTIN: diskpeek
+   Counts files, directories, and regular-file sizes.
+   ========================================================= */
+
+static void diskpeek_scan(const char *path,
+                          long *files,
+                          long *directories,
+                          unsigned long long *bytes)
+{
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+
+    if (dir == NULL)
+        return;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        char full_path[4096];
+        struct stat info;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        int written = snprintf(full_path, sizeof(full_path),
+                               "%s/%s", path, entry->d_name);
+
+        if (written < 0 || (size_t)written >= sizeof(full_path))
+            continue;
+
+        if (lstat(full_path, &info) == -1)
+            continue;
+
+        if (S_ISDIR(info.st_mode))
+        {
+            (*directories)++;
+            diskpeek_scan(full_path, files, directories, bytes);
+        }
+        else if (S_ISREG(info.st_mode))
+        {
+            (*files)++;
+
+            if (info.st_size > 0)
+                *bytes += (unsigned long long)info.st_size;
+        }
+    }
+
+    closedir(dir);
+}
+
+static int builtin_diskpeek(command_t *cmd)
+{
+    const char *path = ".";
+
+    long files = 0;
+    long directories = 0;
+    unsigned long long bytes = 0;
+
+    if (cmd->argc > 2)
+    {
+        fprintf(stderr, "diskpeek: usage: diskpeek [directory]\n");
+        return 1;
+    }
+
+    if (cmd->argc == 2)
+        path = cmd->argv[1];
+
+    struct stat info;
+
+    if (stat(path, &info) == -1)
+    {
+        perror("diskpeek");
+        return 1;
+    }
+
+    if (!S_ISDIR(info.st_mode))
+    {
+        fprintf(stderr, "diskpeek: '%s' is not a directory\n", path);
+        return 1;
+    }
+
+    diskpeek_scan(path, &files, &directories, &bytes);
+
+    printf("\nDiskPeek Report\n");
+    printf("-------------------------\n");
+    printf("Directory   : %s\n", path);
+    printf("Files       : %ld\n", files);
+    printf("Directories : %ld\n", directories);
+    printf("Total size  : %.2f MB\n",
+           (double)bytes / (1024.0 * 1024.0));
+    printf("-------------------------\n");
+
+    return 0;
+}
+
